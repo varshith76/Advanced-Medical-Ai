@@ -1,18 +1,24 @@
 import streamlit as st
-from PIL import Image
-import io
-import base64
 import os
 import sys
 
-# Add project root directory to path to ensure modules import correctly in the cloud
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Force Python to recognize the absolute root directory first
+root_path = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if root_path not in sys.path:
+    sys.path.insert(0, root_path)
 
-# Direct core imports to bypass localhost networking issues
-from core.gradcam import generate_gradcam
-from backend.llm_service import generate_medical_report
-from backend.database import get_db, PredictionHistory, engine
-from sqlalchemy.orm import Session
+from PIL import Image
+import io
+import base64
+
+# Now try importing the core layers safely
+try:
+    from core.gradcam import generate_gradcam
+    from backend.llm_service import generate_medical_report
+    from backend.database import get_db, PredictionHistory, engine
+    from sqlalchemy.orm import Session
+except ImportError as e:
+    st.error(f"📍 Path resolution failure. Current Sys Path: {sys.path}. Error details: {str(e)}")
 
 # Initialize database tables if they do not exist on the cloud instance
 try:
