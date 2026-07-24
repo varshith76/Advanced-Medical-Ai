@@ -1,6 +1,5 @@
---find-links https://pytorch.org
-torch--index-url https://pytorch.org
-torchvision--index-url https://pytorch.org
+torch
+torchvision
 Pillow
 fastapi
 uvicorn
