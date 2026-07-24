@@ -1,11 +1,27 @@
-import streamlit as plt
 import streamlit as st
-import requests
 from PIL import Image
 import io
 import base64
+import os
+import sys
 
-# Set up page configurations
+# Add project root directory to path to ensure modules import correctly in the cloud
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# Direct core imports to bypass localhost networking issues
+from core.gradcam import generate_gradcam
+from backend.llm_service import generate_medical_report
+from backend.database import get_db, PredictionHistory, engine
+from sqlalchemy.orm import Session
+
+# Initialize database tables if they do not exist on the cloud instance
+try:
+    from backend.database import Base
+    Base.metadata.create_all(bind=engine)
+except Exception as db_init_err:
+    pass
+
+# Page configurations
 st.set_page_config(page_title="Advanced Medical AI Platform", layout="wide")
 
 st.title("Advanced Medical AI Intelligence Platform")
@@ -13,33 +29,33 @@ st.write("Upload a chest X-Ray image to generate deep learning predictions, Grad
 
 # --- SIDEBAR HISTORY ---
 st.sidebar.title("Patient Analysis History")
-# Try fetching history from backend if available, otherwise show placeholder
+
 try:
-    # Adjust URL if your backend is hosted separately
-    history_res = requests.get("http://127.0.0", timeout=2)
-    if history_res.status_code == 200:
-        records = history_res.json()
+    db: Session = next(get_db())
+    records = db.query(PredictionHistory).order_by(PredictionHistory.timestamp.desc()).all()
+    
+    if records:
         for idx, rec in enumerate(records):
-            st.sidebar.markdown(f"**Patient {idx+1}: {rec.get('filename')}**")
-            st.sidebar.caption(f"Diagnosis: {rec.get('diagnosis')} ({rec.get('confidence')*100:.1f}%)")
+            st.sidebar.markdown(f"**Patient {idx+1}: {rec.filename}**")
+            st.sidebar.caption(f"Diagnosis: {rec.diagnosis} ({rec.confidence * 100:.1f}%)")
             st.sidebar.divider()
     else:
         st.sidebar.info("No past records found in database.")
-except Exception:
-    st.sidebar.info("Backend database offline. Local history unavailable.")
-
+except Exception as db_err:
+    st.sidebar.info("Local history logs unavailable.")
 
 # --- MAIN INTERFACE: FILE UPLOADER ---
 uploaded_file = st.file_uploader("📂 Drop your Chest X-Ray image here or click to browse", type=["jpg", "jpeg", "png"])
 
 if uploaded_file is not None:
-    # Display the uploaded image immediately
-    image = Image.open(uploaded_file)
+    # Read raw image bytes for processing
+    file_bytes = uploaded_file.read()
+    image = Image.open(io.BytesIO(file_bytes))
     
     col1, col2 = st.columns(2)
     with col1:
         st.subheader("Original Chest X-Ray")
-        st.image(image, use_column_width=True)
+        st.image(image, use_container_width=True)
         
     with col2:
         st.subheader("Analysis Controls")
@@ -48,36 +64,46 @@ if uploaded_file is not None:
     if analyze_btn:
         with st.spinner("Processing image through Deep Learning model, generating Grad-CAM, and querying LLM..."):
             try:
-                # Convert image to bytes to send to API backend
-                img_byte_arr = io.BytesIO()
-                image.save(img_byte_arr, format=image.format if image.format else 'JPEG')
-                img_bytes = img_byte_arr.getvalue()
+                # 1. Run direct core logic for prediction and Grad-CAM
+                diagnosis, confidence, heatmap_bytes = generate_gradcam(file_bytes)
                 
-                # Send request to FastAPI backend (Change URL if backend is deployed on Render/HuggingFace)
-                files = {"file": (uploaded_file.name, img_bytes, f"image/{uploaded_file.type if hasattr(uploaded_file, 'type') else 'jpeg'}")}
-                response = requests.post("http://127.0.0", files=files, timeout=30)
+                # 2. Run direct report generation logic
+                report_text = generate_medical_report(diagnosis, confidence)
                 
-                if response.status_code == 200:
-                    data = response.json()
+                # 3. Save logs to the database directly
+                try:
+                    db: Session = next(get_db())
+                    db_record = PredictionHistory(
+                        filename=uploaded_file.name,
+                        diagnosis=diagnosis,
+                        confidence=float(confidence),
+                        report=report_text
+                    )
+                    db.add(db_record)
+                    db.commit()
+                except Exception as db_save_err:
+                    st.warning("Analysis completed, but prediction could not be saved to history log.")
+
+                # 4. Render UI Visualizations side-by-side
+                with col2:
+                    st.success(f"Prediction Complete: **{diagnosis}**")
+                    st.metric(label="Model Confidence Score", value=f"{confidence * 100:.2f}%")
                     
-                    # Update column 2 with Grad-CAM heatmap result
-                    with col2:
-                        st.success(f"Prediction Complete: **{data.get('diagnosis')}**")
-                        st.metric(label="Model Confidence Score", value=f"{data.get('confidence') * 100:.2f}%")
-                        
-                        # Decode and display the Grad-CAM base64 string image
-                        heatmap_encoded = data.get("heatmap_bytes")
-                        if heatmap_encoded:
-                            heatmap_bytes = base64.b64decode(heatmap_encoded)
-                            st.image(heatmap_bytes, caption="Grad-CAM Pathology Localization Heatmap", use_column_width=True)
-                    
-                    # Display the AI Generated Report below columns
-                    st.divider()
-                    st.subheader("📝 AI-Assisted Clinical Radiology Report Draft")
-                    st.info("⚠️ WARNING: This report is dynamically drafted by an AI Assistant. It must be verified and signed off by a licensed radiologist before clinical applications.")
-                    st.text_area("Generated Draft Text (Editable)", value=data.get("report"), height=300)
-                    
-                else:
-                    st.error(f"Backend API error returned code: {response.status_code}")
+                    if heatmap_bytes:
+                        st.image(heatmap_bytes, caption="Grad-CAM Pathology Localization Heatmap", use_container_width=True)
+                
+                # 5. Display the Generated Medical Report
+                st.divider()
+                st.subheader("📝 AI-Assisted Clinical Radiology Report Draft")
+                st.info("⚠️ WARNING: This report is dynamically drafted by an AI Assistant. It must be verified and signed off by a licensed radiologist before clinical applications.")
+                st.text_area("Generated Draft Text (Editable)", value=report_text, height=300)
+                
+                # Rerun to update the sidebar history record list smoothly
+                st.rerun()
+                
             except Exception as e:
-                st.error(f"Could not reach backend API server. Details: {str(e)}")
+                st.error(f"Internal processing failed. Details: {str(e)}")
+
+# --- TECHNICAL HEALTH CLINICAL DISCLAIMER ---
+st.divider()
+st.caption("ℹ️ **Medical Disclaimer:** This software platform is an AI-powered diagnostic demonstration built for research evaluation. It does not provide definitive medical advice or replace professional human radiological interpretation.")
